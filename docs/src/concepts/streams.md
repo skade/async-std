@@ -73,16 +73,125 @@ Other asynchronous functions that can be used on `Stream`s are:
 * `collect`: read the full stream into a data structure, e.g. a `Vec`. Similar to the `Iterator` method of the same name.
 * `for_each`: apply a closure to every item in the stream, ignoring the result. This is similar to the `Iterator` method of the same name.
 
-## Stream combinators
+## Serial Streams
 
-## Channels
+<img src="/assets/graphs/list.jpg" alt="list" style="max-width:300px">
 
+The most basic way of processing a stream is in a sequence. For each element
+produced in the stream we perform an operation. We guaranteed a new operation is
+run only after the previous operation has ended.
 
-## Stream patterns
+In today's Rust this is usually written using a `while let Some / await` loop,
+`map` or `for_each` combinator:
 
-### Merging
+```rust
+let a = stream::repeat(1u8);
+while let Some(num) = a.next().await {
+    println!("{:?}", num);
+}
 
-### Splitting
+let b = stream::repeat(1u8)
+    .map(|num| dbg!(num));
+
+let c = stream::repeat(1u8)
+    .for_each(|num| println!("{:?}", num));
+```
+
+The difference between `map` and `for_each` is that the former creates a new
+stream of output, while the latter does not accept output. For
+[fallible](https://blog.yoshuawuyts.com/contexts/) streams, there exist
+`try_map` and `try_for_each` counterparts that are able to short-circuit when an
+`Result::Err` is returned.
+
+The `while let Some / await` loop is mostly comparable to the `for_each` /
+`try_for_each` combinators (with the biggest difference being able to manually
+short-circuit using `break` and `continue`).
+
+Serial parsing of streams is most comparable to synchronous loops. Except
+instead of blocking between iterations of the loop, it sleeps the task.
+Just like serial processing of iterators is a common operation, so is serial
+processing of streams.
+
+## Multiplexed Streams
+
+It's not rare to find yourself in a situation where you have multiple streams,
+and you want to act on their combined output. For example there might be a
+stream of events from a channel, but also another stream that checks for a
+"shutdown" event.
+
+```rust
+let events = events.recv();       // stream of events
+let shutdown = shutdown.recv();   // stream of shutdown events
+```
+
+Perhaps you'd like to expose a combined stream of both streams (as might be the
+case for networking protocols), or simply await both streams concurrently. The
+solution to that would be to map both streams to a shared enum, and then merge
+both streams into a single stream. The output can then be looped and matched
+over as you're used to:
+
+[`stream::merge` method]: https://docs.rs/async-std/latest/async_std/stream/trait.Stream.html#method.merge
+
+```rust
+enum Event<T> {
+    Message<T>,
+    Shutdown,
+}
+
+let events = rx.recv().map(|ev| Event::Message(ev));
+let shutdown = shutdown.recv().map(|_| Event::Shutdown);
+let s = events.merge(shutdown); // Combined stream of both
+
+while let Some(ev) = s.next().await {
+    match ev {
+        Event::Message(msg) => println!("message was: {:?}", msg),
+        Event::Shutdown => break,
+    }
+}
+```
+
+In `async-std` we provide the [`stream::merge` method] to merge multiple streams
+into a single stream. This is different from `futures-rs` which provides the
+Golang-inspired [`select! {}`]. As `async-std` implements a fully `futures-rs` compatible interface, you can opt into using `select` instead.
+
+Both approaches achieve more or less the same goals. But we felt `merge` would
+be both simpler in both implementation and usage because it leaves much of the
+trickier control flow constructs up to existing keywords such as `match`,
+`break`, and `continue`.
+
+## Branching Streams
+
+Sometimes you have a single stream that you want to convert into multiple
+streams. The way to do this in `std` is by using [`crossbeam_channel`] (because
+don't use std channels).
+
+Similarly in async Rust `channel` is the right abstraction. By creating multiple
+channels we can use it to split a single stream into multiple streams based on
+its output.
+
+[`crossbeam_channel`]: https://docs.rs/crossbeam-channel/0.3.9/crossbeam_channel/
+[`sync::channel`]: https://doc.rust-lang.org/std/sync/mpsc/fn.channel.html
+
+```rust
+use async_std::stream;
+use async_std::sync;
+
+let a = sync::channel::new();
+let b = sync::channel::new();
+
+let s = stream::repeat(10u8).take(20);
+while let Some(num) = s.next().await {
+    match num % 1 {
+        0 => a.send(num).await;
+        _ => b.send(num).await;
+    }
+}
+```
+
+Channels are currently [still being
+built](https://github.com/async-rs/async-std/issues/212) for `async-std`, but
+we expect to have them available in the near future.
+
 
 ## Channels
 
