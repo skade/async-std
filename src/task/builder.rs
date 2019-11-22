@@ -1,6 +1,6 @@
-use kv_log_macro::trace;
-use log::log_enabled;
 use std::future::Future;
+
+use kv_log_macro::trace;
 
 use crate::io;
 use crate::task::executor;
@@ -37,12 +37,10 @@ impl Builder {
         let task = Task::new(self.name);
 
         // Log this `spawn` operation.
-        if log_enabled!(log::Level::Trace) {
-            trace!("spawn", {
-                task_id: task.id().0,
-                parent_task_id: Task::get_current(|t| t.id().0).unwrap_or(0),
-            });
-        }
+        trace!("spawn", {
+            task_id: task.id().0,
+            parent_task_id: Task::get_current(|t| t.id().0).unwrap_or(0),
+        });
 
         let future = async move {
             // Drop task-locals on exit.
@@ -52,13 +50,9 @@ impl Builder {
 
             // Log completion on exit.
             defer! {
-                if log_enabled!(log::Level::Trace) {
-                    Task::get_current(|t| {
-                        trace!("completed", {
-                            task_id: t.id().0,
-                        });
-                    });
-                }
+                trace!("completed", {
+                    task_id: Task::get_current(|t| t.id().0),
+                });
             }
 
             future.await
