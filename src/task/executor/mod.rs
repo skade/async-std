@@ -7,7 +7,4 @@
 
 pub(crate) use pool::schedule;
 
-use sleepers::Sleepers;
-
 mod pool;
-mod sleepers;

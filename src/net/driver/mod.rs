@@ -1,5 +1,6 @@
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use mio::{self, Evented};
 use once_cell::sync::Lazy;
@@ -27,6 +28,8 @@ struct Reactor {
     /// A mio instance that polls for new events.
     poller: mio::Poll,
 
+    events: Mutex<mio::Events>,
+
     /// A collection of registered I/O handles.
     entries: Mutex<Slab<Arc<Entry>>>,
 
@@ -45,6 +48,7 @@ impl Reactor {
 
         let mut reactor = Reactor {
             poller,
+            events: Mutex::new(mio::Events::with_capacity(1000)),
             entries: Mutex::new(Slab::new()),
             notify_reg,
             notify_token: mio::Token(0),
@@ -92,73 +96,76 @@ impl Reactor {
         Ok(())
     }
 
-    // fn notify(&self) {
-    //     self.notify_reg
-    //         .1
-    //         .set_readiness(mio::Ready::readable())
-    //         .unwrap();
-    // }
+    fn notify(&self) {
+        self.notify_reg
+            .1
+            .set_readiness(mio::Ready::readable())
+            .unwrap();
+    }
 }
 
 /// The state of the global networking driver.
 static REACTOR: Lazy<Reactor> = Lazy::new(|| {
-    // Spawn a thread that waits on the poller for new events and wakes up tasks blocked on I/O
-    // handles.
-    std::thread::Builder::new()
-        .name("async-std/net".to_string())
-        .spawn(move || {
-            // If the driver thread panics, there's not much we can do. It is not a
-            // recoverable error and there is no place to propagate it into so we just abort.
-            abort_on_panic(|| {
-                main_loop().expect("async networking thread has panicked");
-            })
-        })
-        .expect("cannot start a thread driving blocking tasks");
+    crate::task::spawn(async {}); // TODO: remove this hack
 
     Reactor::new().expect("cannot initialize reactor")
 });
 
+pub(crate) fn notify() {
+    REACTOR.notify();
+}
+
+pub(crate) fn poll_quick() {
+    if let Ok(mut events) = REACTOR.events.try_lock() {
+        abort_on_panic(|| poll_internal(&mut events, Some(Duration::from_secs(0))).unwrap());
+    }
+}
+
+pub(crate) fn poll() {
+    let mut events = REACTOR.events.lock().unwrap();
+    abort_on_panic(|| poll_internal(&mut events, None).unwrap());
+}
+
 /// Waits on the poller for new events and wakes up tasks blocked on I/O handles.
-fn main_loop() -> io::Result<()> {
+fn poll_internal(events: &mut mio::Events, timeout: Option<Duration>) -> io::Result<()> {
     let reactor = &REACTOR;
-    let mut events = mio::Events::with_capacity(1000);
 
-    loop {
-        // Block on the poller until at least one new event comes in.
-        reactor.poller.poll(&mut events, None)?;
+    // Block on the poller until at least one new event comes in.
+    reactor.poller.poll(events, timeout)?;
 
-        // Lock the entire entry table while we're processing new events.
-        let entries = reactor.entries.lock().unwrap();
+    // Lock the entire entry table while we're processing new events.
+    let entries = reactor.entries.lock().unwrap();
 
-        for event in events.iter() {
-            let token = event.token();
+    for event in events.iter() {
+        let token = event.token();
 
-            if token == reactor.notify_token {
-                // If this is the notification token, we just need the notification state.
-                reactor.notify_reg.1.set_readiness(mio::Ready::empty())?;
-            } else {
-                // Otherwise, look for the entry associated with this token.
-                if let Some(entry) = entries.get(token.0) {
-                    // Set the readiness flags from this I/O event.
-                    let readiness = event.readiness();
+        if token == reactor.notify_token {
+            // If this is the notification token, we just need the notification state.
+            reactor.notify_reg.1.set_readiness(mio::Ready::empty())?;
+        } else {
+            // Otherwise, look for the entry associated with this token.
+            if let Some(entry) = entries.get(token.0) {
+                // Set the readiness flags from this I/O event.
+                let readiness = event.readiness();
 
-                    // Wake up reader tasks blocked on this I/O handle.
-                    if !(readiness & reader_interests()).is_empty() {
-                        for w in entry.readers.lock().unwrap().drain(..) {
-                            w.wake();
-                        }
+                // Wake up reader tasks blocked on this I/O handle.
+                if !(readiness & reader_interests()).is_empty() {
+                    for w in entry.readers.lock().unwrap().drain(..) {
+                        w.wake();
                     }
+                }
 
-                    // Wake up writer tasks blocked on this I/O handle.
-                    if !(readiness & writer_interests()).is_empty() {
-                        for w in entry.writers.lock().unwrap().drain(..) {
-                            w.wake();
-                        }
+                // Wake up writer tasks blocked on this I/O handle.
+                if !(readiness & writer_interests()).is_empty() {
+                    for w in entry.writers.lock().unwrap().drain(..) {
+                        w.wake();
                     }
                 }
             }
         }
     }
+
+    Ok(())
 }
 
 /// An I/O handle powered by the networking driver.
