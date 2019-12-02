@@ -1,11 +1,10 @@
 use std::cell::Cell;
 use std::sync::atomic::{self, AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
-use crossbeam_queue::ArrayQueue;
 use once_cell::sync::Lazy;
 use once_cell::unsync::OnceCell;
 
@@ -13,57 +12,28 @@ use crate::task::Runnable;
 use crate::utils::{abort_on_panic, random, Spinlock};
 
 /// The state of an executor.
-struct Pool {
+struct Executor {
     /// The global queue of tasks.
     injector: Injector<Runnable>,
 
     /// Handles to local queues for stealing work from worker threads.
     stealers: Vec<Stealer<Runnable>>,
 
-    num_procs: usize,
-    procs: ArrayQueue<Processor>,
     sleeps: AtomicU64,
+
     deep_sleep: AtomicBool,
+
+    pool: Mutex<Pool>,
 }
 
-/// Global executor that runs spawned tasks.
-static POOL: Lazy<Pool> = Lazy::new(|| {
-    let num_procs = num_cpus::get().max(1);
-    let mut stealers = Vec::new();
-    let procs = ArrayQueue::new(num_procs);
+struct Pool {
+    procs: Vec<Processor>,
 
-    // Spawn worker threads.
-    for _ in 0..num_procs {
-        let worker = Worker::new_fifo();
-        stealers.push(worker.stealer());
-
-        let proc = Processor {
-            tick: AtomicU64::new(0),
-            worker,
-            slot: Cell::new(None),
-        };
-        procs.push(proc).unwrap();
-    }
-
-    thread::Builder::new()
-        .name("async-std/sysmon".to_string())
-        .spawn(|| abort_on_panic(sysmon))
-        .expect("cannot start a sysmon thread");
-
-    Pool {
-        injector: Injector::new(),
-        stealers,
-        num_procs,
-        procs,
-        sleeps: AtomicU64::new(0),
-        deep_sleep: AtomicBool::new(false),
-    }
-});
+    machs: Vec<Arc<Machine>>,
+}
 
 /// The state of a worker thread.
 struct Processor {
-    tick: AtomicU64,
-
     /// The local task queue.
     worker: Worker<Runnable>,
 
@@ -71,62 +41,128 @@ struct Processor {
     slot: Cell<Option<Runnable>>,
 }
 
+struct Machine {
+    proc: Spinlock<Option<Processor>>,
+    sleeping: AtomicBool,
+    progress: AtomicBool,
+}
+
+impl Machine {
+    fn new(proc: Processor) -> Machine {
+        Machine {
+            proc: Spinlock::new(Some(proc)),
+            sleeping: AtomicBool::new(false),
+            progress: AtomicBool::new(true),
+        }
+    }
+}
+
+/// Global executor that runs spawned tasks.
+static EXECUTOR: Lazy<Executor> = Lazy::new(|| {
+    let num_procs = num_cpus::get().max(1);
+    let mut stealers = Vec::new();
+    let mut procs = Vec::new();
+
+    // Spawn worker threads.
+    for _ in 0..num_procs {
+        let worker = Worker::new_fifo();
+        stealers.push(worker.stealer());
+
+        let proc = Processor {
+            worker,
+            slot: Cell::new(None),
+        };
+        procs.push(proc);
+    }
+
+    thread::Builder::new()
+        .name("async-std/sysmon".to_string())
+        .spawn(|| abort_on_panic(sysmon))
+        .expect("cannot start a sysmon thread");
+
+    let proc = procs.pop().unwrap();
+    let mach = Arc::new(Machine::new(proc));
+    start_worker(mach.clone());
+
+    Executor {
+        injector: Injector::new(),
+        stealers,
+        pool: Mutex::new(Pool {
+            procs: procs,
+            machs: vec![mach],
+        }),
+        sleeps: AtomicU64::new(0),
+        deep_sleep: AtomicBool::new(false),
+    }
+});
+
 thread_local! {
     /// Worker thread state.
-    static PROCESSOR: OnceCell<Arc<Spinlock<Option<Processor>>>> = OnceCell::new();
+    static MACHINE: OnceCell<Arc<Machine>> = OnceCell::new();
 }
 
 /// Schedules a new runnable task for execution.
 pub(crate) fn schedule(task: Runnable) {
     let mut notify = false;
 
-    PROCESSOR.with(|proc| {
+    MACHINE.with(|mach| {
         // If the current thread is a worker thread, store it into its task slot or push it into
         // its local task queue. Otherwise, push it into the global task queue.
-        match proc.get() {
-            Some(proc) => {
-                if let Some(proc) = proc.lock().as_ref() {
+        match mach.get() {
+            Some(mach) => {
+                if let Some(proc) = mach.proc.lock().as_ref() {
                     // Replace the task in the slot.
                     if let Some(task) = proc.slot.replace(Some(task)) {
                         // If the slot already contained a task, push it into the local task queue.
                         proc.worker.push(task);
                         notify = true;
                     }
+                    return;
                 }
-                return;
             }
             None => {}
         }
 
-        POOL.injector.push(task);
+        EXECUTOR.injector.push(task);
         notify = true;
     });
 
-    // TODO: if there is stealable work (in proc.worker or injector), notify mio
-    if notify && POOL.deep_sleep.load(Ordering::SeqCst) {
+    if notify && EXECUTOR.deep_sleep.load(Ordering::SeqCst) {
         atomic::fence(Ordering::SeqCst);
         crate::net::driver::notify();
     }
 }
 
-// TODO: rename sysmon to scheduler?
 fn sysmon() {
     let mut sleeps = 0;
     loop {
-        if POOL.procs.len() == POOL.num_procs {
-            start_worker(POOL.procs.pop().unwrap());
-        }
-
-        // XXX: check if worker threads can keep up, if not, spawn another one
         thread::sleep(Duration::from_millis(10));
 
-        let s = POOL.sleeps.load(Ordering::SeqCst);
-        if sleeps != s {
-            sleeps = s;
-        } else {
-            if !POOL.deep_sleep.load(Ordering::SeqCst) {
-                if let Ok(proc) = POOL.procs.pop() {
-                    start_worker(proc);
+        {
+            let mut pool = EXECUTOR.pool.lock().unwrap();
+
+            for m in &mut pool.machs {
+                if !m.sleeping.load(Ordering::SeqCst) && !m.progress.swap(false, Ordering::SeqCst) {
+                    let proc = m.proc.lock().take();
+                    if let Some(proc) = proc {
+                        *m = Arc::new(Machine::new(proc));
+                        // println!("STEAL");
+                        start_worker(m.clone());
+                    }
+                }
+            }
+
+            let s = EXECUTOR.sleeps.load(Ordering::SeqCst);
+            if sleeps != s {
+                sleeps = s;
+            } else {
+                if !EXECUTOR.deep_sleep.load(Ordering::SeqCst) {
+                    if let Some(proc) = pool.procs.pop() {
+                        let mach = Arc::new(Machine::new(proc));
+                        pool.machs.push(mach.clone());
+                        // println!("START");
+                        start_worker(mach);
+                    }
                 }
             }
         }
@@ -135,30 +171,18 @@ fn sysmon() {
     }
 }
 
-fn start_worker(proc: Processor) {
-    // println!("START");
+fn start_worker(mach: Arc<Machine>) {
     thread::Builder::new()
         .name("async-std/worker".to_string())
         .spawn(|| {
-            let _ = PROCESSOR.with(|p| p.set(Arc::new(Spinlock::new(Some(proc)))));
-            abort_on_panic(main_loop);
+            let _ = MACHINE.with(|p| p.set(mach));
+            abort_on_panic(worker);
         })
         .expect("cannot start a worker thread");
 }
 
-fn stop_worker() {
-    // println!("STOP");
-
-    PROCESSOR.with(|proc| {
-        POOL.procs
-            .push(proc.get().unwrap().lock().take().unwrap())
-            .unwrap();
-    });
-}
-
-// TODO: rename to worker() or executor()?
 /// Main loop running a worker thread.
-fn main_loop() {
+fn worker() {
     /// Number of yields when no runnable task is found.
     const YIELDS: u32 = 3;
     /// Number of short sleeps when no runnable task in found.
@@ -176,57 +200,95 @@ fn main_loop() {
 
             crate::net::driver::poll_quick();
 
-            PROCESSOR.with(|proc| {
-                let proc = proc.get().unwrap().lock();
-                let proc = proc.as_ref().unwrap();
+            MACHINE.with(|mach| {
+                let mach = mach.get().unwrap();
 
-                while let Steal::Retry = POOL.injector.steal_batch(&proc.worker) {}
+                if let Some(proc) = mach.proc.lock().as_ref() {
+                    while let Steal::Retry = EXECUTOR.injector.steal_batch(&proc.worker) {}
 
-                if let Some(task) = proc.slot.take() {
-                    proc.worker.push(task);
+                    if let Some(task) = proc.slot.take() {
+                        proc.worker.push(task);
+                    }
                 }
             });
         }
 
         // Try to find a runnable task.
-        match find_runnable() {
-            Some(task) => {
-                runs += 1;
-                fails = 0;
+        if let Some(task) = find_runnable() {
+            task.run();
+            runs += 1;
+            fails = 0;
+            continue;
+        }
 
-                // Run the found task.
-                task.run();
-            }
-            None => {
-                runs = 0;
-                fails += 1;
-
-                // Yield the current thread or put it to sleep.
-                if fails <= YIELDS {
-                    thread::yield_now();
-                } else if fails <= YIELDS + SLEEPS {
-                    thread::sleep(Duration::from_micros(10));
-                } else {
-                    if POOL.deep_sleep.swap(true, Ordering::SeqCst) {
-                        stop_worker();
-                        return;
-                    } else {
-                        POOL.sleeps.fetch_add(1, Ordering::SeqCst);
-                        crate::net::driver::poll();
-                        POOL.deep_sleep.store(false, Ordering::SeqCst);
-                    }
-                }
+        {
+            let is_stolen = MACHINE.with(|mach| {
+                let mach = mach.get().unwrap().proc.lock();
+                mach.is_none()
+            });
+            if is_stolen {
+                // println!("STOLEN");
+                // NOTE: return instead of break
+                return;
             }
         }
+
+        runs = 0;
+        fails += 1;
+
+        // Yield the current thread or put it to sleep.
+        if fails <= YIELDS {
+            thread::yield_now();
+        } else if fails <= YIELDS + SLEEPS {
+            thread::sleep(Duration::from_micros(10));
+        } else {
+            // TODO: can this be a lock over mio?
+            if EXECUTOR.deep_sleep.swap(true, Ordering::SeqCst) {
+                break;
+            }
+
+            if let Some(task) = find_runnable() {
+                EXECUTOR.deep_sleep.store(false, Ordering::SeqCst);
+                task.run();
+                runs += 1;
+                fails = 0;
+                continue;
+            }
+
+            EXECUTOR.sleeps.fetch_add(1, Ordering::SeqCst);
+
+            MACHINE.with(|mach| {
+                let mach = mach.get().unwrap();
+                mach.sleeping.store(true, Ordering::SeqCst);
+                crate::net::driver::poll();
+                mach.sleeping.store(false, Ordering::SeqCst);
+            });
+
+            EXECUTOR.deep_sleep.store(false, Ordering::SeqCst);
+        }
     }
+
+    MACHINE.with(|mach| {
+        let arc = mach.get().unwrap();
+        let mut proc = arc.proc.lock();
+
+        if let Some(proc) = proc.take() {
+            let mut pool = EXECUTOR.pool.lock().unwrap();
+            pool.procs.push(proc);
+            pool.machs.retain(|p| !Arc::ptr_eq(p, arc));
+        }
+    });
 }
 
 /// Find the next runnable task.
 fn find_runnable() -> Option<Runnable> {
-    PROCESSOR
-        .with(|proc| {
-            let proc = proc.get().unwrap().lock();
+    MACHINE.with(|mach| {
+        {
+            let mach = mach.get().unwrap();
+            let proc = mach.proc.lock();
             let proc = proc.as_ref()?;
+
+            mach.progress.store(true, Ordering::SeqCst);
 
             if let Some(task) = proc.slot.take() {
                 return Some(task);
@@ -237,49 +299,45 @@ fn find_runnable() -> Option<Runnable> {
             }
 
             loop {
-                match POOL.injector.steal_batch_and_pop(&proc.worker) {
+                match EXECUTOR.injector.steal_batch_and_pop(&proc.worker) {
                     Steal::Retry => {}
                     Steal::Empty => break,
                     Steal::Success(task) => return Some(task),
                 }
             }
+        }
 
-            None
-        })
-        .or_else(|| {
-            crate::net::driver::poll_quick();
+        crate::net::driver::poll_quick();
 
-            PROCESSOR.with(|proc| {
-                let proc = proc.get().unwrap().lock();
-                let proc = proc.as_ref()?;
+        let mach = mach.get().unwrap().proc.lock();
+        let proc = mach.as_ref()?;
 
-                if let Some(task) = proc.slot.take() {
-                    return Some(task);
+        if let Some(task) = proc.slot.take() {
+            return Some(task);
+        }
+
+        // First, pick a random starting point in the list of local queues.
+        let len = EXECUTOR.stealers.len();
+        let start = random(len as u32) as usize;
+
+        let mut retry = true;
+        while retry {
+            retry = false;
+
+            // Try stealing a batch of tasks from each local queue starting from the
+            // chosen point.
+            let (l, r) = EXECUTOR.stealers.split_at(start);
+            let stealers = r.iter().chain(l.iter());
+
+            for s in stealers {
+                match s.steal_batch_and_pop(&proc.worker) {
+                    Steal::Retry => retry = true,
+                    Steal::Empty => {}
+                    Steal::Success(task) => return Some(task),
                 }
+            }
+        }
 
-                // First, pick a random starting point in the list of local queues.
-                let len = POOL.stealers.len();
-                let start = random(len as u32) as usize;
-
-                let mut retry = true;
-                while retry {
-                    retry = false;
-
-                    // Try stealing a batch of tasks from each local queue starting from the
-                    // chosen point.
-                    let (l, r) = POOL.stealers.split_at(start);
-                    let stealers = r.iter().chain(l.iter());
-
-                    for s in stealers {
-                        match s.steal_batch_and_pop(&proc.worker) {
-                            Steal::Retry => retry = true,
-                            Steal::Empty => {}
-                            Steal::Success(task) => return Some(task),
-                        }
-                    }
-                }
-
-                None
-            })
-        })
+        None
+    })
 }

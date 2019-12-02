@@ -149,14 +149,16 @@ fn poll_internal(events: &mut mio::Events, timeout: Option<Duration>) -> io::Res
                 let readiness = event.readiness();
 
                 // Wake up reader tasks blocked on this I/O handle.
-                if !(readiness & reader_interests()).is_empty() {
+                let reader_interests = mio::Ready::all() - mio::Ready::writable();
+                if !(readiness & reader_interests).is_empty() {
                     for w in entry.readers.lock().unwrap().drain(..) {
                         w.wake();
                     }
                 }
 
                 // Wake up writer tasks blocked on this I/O handle.
-                if !(readiness & writer_interests()).is_empty() {
+                let writer_interests = mio::Ready::all() - mio::Ready::readable();
+                if !(readiness & writer_interests).is_empty() {
                     for w in entry.writers.lock().unwrap().drain(..) {
                         w.wake();
                     }
@@ -295,28 +297,4 @@ impl<T: Evented + fmt::Debug> fmt::Debug for Watcher<T> {
             .field("source", &self.source)
             .finish()
     }
-}
-
-/// Returns a mask containing flags that interest tasks reading from I/O handles.
-#[inline]
-fn reader_interests() -> mio::Ready {
-    mio::Ready::all() - mio::Ready::writable()
-}
-
-/// Returns a mask containing flags that interest tasks writing into I/O handles.
-#[inline]
-fn writer_interests() -> mio::Ready {
-    mio::Ready::writable() | hup()
-}
-
-/// Returns a flag containing the hangup status.
-#[inline]
-fn hup() -> mio::Ready {
-    #[cfg(unix)]
-    let ready = mio::unix::UnixReady::hup().into();
-
-    #[cfg(not(unix))]
-    let ready = mio::Ready::empty();
-
-    ready
 }
