@@ -232,6 +232,9 @@ impl<T: Evented> Watcher<T> {
         Poll::Pending
     }
 
+    // TODO: poll_readable()
+    // TODO: poll_writable()
+
     /// Polls the inner I/O source for a non-blocking write operation.
     ///
     /// If the operation returns an error of the `io::ErrorKind::WouldBlock` kind, the current task
