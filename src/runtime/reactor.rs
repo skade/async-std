@@ -3,12 +3,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mio::{self, Evented};
-use once_cell::sync::Lazy;
 use slab::Slab;
 
 use crate::io;
+use crate::runtime::SCHEDULER;
 use crate::task::{Context, Poll, Waker};
-use crate::utils::abort_on_panic;
 
 /// Data associated with a registered I/O handle.
 #[derive(Debug)]
@@ -19,15 +18,16 @@ struct Entry {
     /// Tasks that are blocked on reading from this I/O handle.
     readers: Mutex<Vec<Waker>>,
 
-    /// Thasks that are blocked on writing to this I/O handle.
+    /// Tasks that are blocked on writing to this I/O handle.
     writers: Mutex<Vec<Waker>>,
 }
 
 /// The state of a networking driver.
-struct Reactor {
+pub struct Reactor {
     /// A mio instance that polls for new events.
     poller: mio::Poll,
 
+    /// A list into which mio stores events.
     events: Mutex<mio::Events>,
 
     /// A collection of registered I/O handles.
@@ -42,7 +42,7 @@ struct Reactor {
 
 impl Reactor {
     /// Creates a new reactor for polling I/O events.
-    fn new() -> io::Result<Reactor> {
+    pub fn new() -> io::Result<Reactor> {
         let poller = mio::Poll::new()?;
         let notify_reg = mio::Registration::new2();
 
@@ -96,78 +96,66 @@ impl Reactor {
         Ok(())
     }
 
-    fn notify(&self) {
-        self.notify_reg
-            .1
-            .set_readiness(mio::Ready::readable())
-            .unwrap();
+    /// Notifies the reactor so that polling stops blocking.
+    pub fn notify(&self) -> io::Result<()> {
+        self.notify_reg.1.set_readiness(mio::Ready::readable())
     }
-}
 
-/// The state of the global networking driver.
-static REACTOR: Lazy<Reactor> = Lazy::new(|| {
-    crate::task::spawn(async {}); // TODO: remove this hack
-
-    Reactor::new().expect("cannot initialize reactor")
-});
-
-pub(crate) fn notify() {
-    REACTOR.notify();
-}
-
-pub(crate) fn poll_quick() {
-    if let Ok(mut events) = REACTOR.events.try_lock() {
-        abort_on_panic(|| poll_internal(&mut events, Some(Duration::from_secs(0))).unwrap());
+    /// Polls new events without blocking.
+    pub fn poll_quick(&self) -> io::Result<()> {
+        if let Ok(mut events) = self.events.try_lock() {
+            self.poll_internal(&mut events, Some(Duration::from_secs(0)))?;
+        }
+        Ok(())
     }
-}
 
-pub(crate) fn poll() {
-    let mut events = REACTOR.events.lock().unwrap();
-    abort_on_panic(|| poll_internal(&mut events, None).unwrap());
-}
+    /// Polls new events, blocking until the first event appears or the reactor is notified.
+    pub fn poll(&self) -> io::Result<()> {
+        let mut events = self.events.lock().unwrap();
+        self.poll_internal(&mut events, None)
+    }
 
-/// Waits on the poller for new events and wakes up tasks blocked on I/O handles.
-fn poll_internal(events: &mut mio::Events, timeout: Option<Duration>) -> io::Result<()> {
-    let reactor = &REACTOR;
+    /// Waits on the poller for new events and wakes up tasks blocked on I/O handles.
+    fn poll_internal(&self, events: &mut mio::Events, timeout: Option<Duration>) -> io::Result<()> {
+        // Block on the poller until at least one new event comes in.
+        self.poller.poll(events, timeout)?;
 
-    // Block on the poller until at least one new event comes in.
-    reactor.poller.poll(events, timeout)?;
+        // Lock the entire entry table while we're processing new events.
+        let entries = self.entries.lock().unwrap();
 
-    // Lock the entire entry table while we're processing new events.
-    let entries = reactor.entries.lock().unwrap();
+        for event in events.iter() {
+            let token = event.token();
 
-    for event in events.iter() {
-        let token = event.token();
+            if token == self.notify_token {
+                // If this is the notification token, we just need the notification state.
+                self.notify_reg.1.set_readiness(mio::Ready::empty())?;
+            } else {
+                // Otherwise, look for the entry associated with this token.
+                if let Some(entry) = entries.get(token.0) {
+                    // Set the readiness flags from this I/O event.
+                    let readiness = event.readiness();
 
-        if token == reactor.notify_token {
-            // If this is the notification token, we just need the notification state.
-            reactor.notify_reg.1.set_readiness(mio::Ready::empty())?;
-        } else {
-            // Otherwise, look for the entry associated with this token.
-            if let Some(entry) = entries.get(token.0) {
-                // Set the readiness flags from this I/O event.
-                let readiness = event.readiness();
-
-                // Wake up reader tasks blocked on this I/O handle.
-                let reader_interests = mio::Ready::all() - mio::Ready::writable();
-                if !(readiness & reader_interests).is_empty() {
-                    for w in entry.readers.lock().unwrap().drain(..) {
-                        w.wake();
+                    // Wake up reader tasks blocked on this I/O handle.
+                    let reader_interests = mio::Ready::all() - mio::Ready::writable();
+                    if !(readiness & reader_interests).is_empty() {
+                        for w in entry.readers.lock().unwrap().drain(..) {
+                            w.wake();
+                        }
                     }
-                }
 
-                // Wake up writer tasks blocked on this I/O handle.
-                let writer_interests = mio::Ready::all() - mio::Ready::readable();
-                if !(readiness & writer_interests).is_empty() {
-                    for w in entry.writers.lock().unwrap().drain(..) {
-                        w.wake();
+                    // Wake up writer tasks blocked on this I/O handle.
+                    let writer_interests = mio::Ready::all() - mio::Ready::readable();
+                    if !(readiness & writer_interests).is_empty() {
+                        for w in entry.writers.lock().unwrap().drain(..) {
+                            w.wake();
+                        }
                     }
                 }
             }
         }
-    }
 
-    Ok(())
+        Ok(())
+    }
 }
 
 /// An I/O handle powered by the networking driver.
@@ -189,7 +177,8 @@ impl<T: Evented> Watcher<T> {
     /// lifetime of the returned I/O handle.
     pub fn new(source: T) -> Watcher<T> {
         Watcher {
-            entry: REACTOR
+            entry: SCHEDULER
+                .reactor()
                 .register(&source)
                 .expect("cannot register an I/O event source"),
             source: Some(source),
@@ -232,9 +221,6 @@ impl<T: Evented> Watcher<T> {
         Poll::Pending
     }
 
-    // TODO: poll_readable()
-    // TODO: poll_writable()
-
     /// Polls the inner I/O source for a non-blocking write operation.
     ///
     /// If the operation returns an error of the `io::ErrorKind::WouldBlock` kind, the current task
@@ -276,7 +262,8 @@ impl<T: Evented> Watcher<T> {
     #[allow(dead_code)]
     pub fn into_inner(mut self) -> T {
         let source = self.source.take().unwrap();
-        REACTOR
+        SCHEDULER
+            .reactor()
             .deregister(&source, &self.entry)
             .expect("cannot deregister I/O event source");
         source
@@ -286,7 +273,8 @@ impl<T: Evented> Watcher<T> {
 impl<T: Evented> Drop for Watcher<T> {
     fn drop(&mut self) {
         if let Some(ref source) = self.source {
-            REACTOR
+            SCHEDULER
+                .reactor()
                 .deregister(source, &self.entry)
                 .expect("cannot deregister I/O event source");
         }

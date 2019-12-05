@@ -3,7 +3,7 @@ use std::future::Future;
 use kv_log_macro::trace;
 
 use crate::io;
-use crate::task::executor;
+use crate::runtime::SCHEDULER;
 use crate::task::{JoinHandle, Task};
 use crate::utils::abort_on_panic;
 
@@ -58,7 +58,7 @@ impl Builder {
             future.await
         };
 
-        let schedule = move |t| executor::schedule(Runnable(t));
+        let schedule = move |t| SCHEDULER.schedule(Runnable(t));
         let (task, handle) = async_task::spawn(future, schedule, task);
         task.schedule();
         Ok(JoinHandle::new(handle))
@@ -66,7 +66,7 @@ impl Builder {
 }
 
 /// A runnable task.
-pub(crate) struct Runnable(async_task::Task<Task>);
+pub struct Runnable(async_task::Task<Task>);
 
 impl Runnable {
     /// Runs the task by polling its future once.
