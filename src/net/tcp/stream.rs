@@ -4,7 +4,7 @@ use std::pin::Pin;
 
 use crate::future;
 use crate::io::{self, Read, Write};
-use crate::runtime::Watcher;
+use crate::rt::Watcher;
 use crate::net::ToSocketAddrs;
 use crate::task::{spawn_blocking, Context, Poll};
 

@@ -209,7 +209,7 @@ cfg_std! {
     pub mod sync;
     pub mod task;
 
-    pub(crate) mod runtime;
+    pub(crate) mod rt;
 }
 
 cfg_default! {

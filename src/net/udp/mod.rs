@@ -4,7 +4,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::future;
 use crate::net::ToSocketAddrs;
-use crate::runtime::Watcher;
+use crate::rt::Watcher;
 
 /// A UDP socket.
 ///

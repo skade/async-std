@@ -6,7 +6,7 @@ use mio::{self, Evented};
 use slab::Slab;
 
 use crate::io;
-use crate::runtime::SCHEDULER;
+use crate::rt::RUNTIME;
 use crate::task::{Context, Poll, Waker};
 
 /// Data associated with a registered I/O handle.
@@ -101,24 +101,12 @@ impl Reactor {
         self.notify_reg.1.set_readiness(mio::Ready::readable())
     }
 
-    /// Polls new events without blocking.
-    pub fn poll_quick(&self) -> io::Result<()> {
-        if let Ok(mut events) = self.events.try_lock() {
-            self.poll_internal(&mut events, Some(Duration::from_secs(0)))?;
-        }
-        Ok(())
-    }
-
-    /// Polls new events, blocking until the first event appears or the reactor is notified.
-    pub fn poll(&self) -> io::Result<()> {
-        let mut events = self.events.lock().unwrap();
-        self.poll_internal(&mut events, None)
-    }
-
     /// Waits on the poller for new events and wakes up tasks blocked on I/O handles.
-    fn poll_internal(&self, events: &mut mio::Events, timeout: Option<Duration>) -> io::Result<()> {
+    pub fn poll(&self, timeout: Option<Duration>) -> io::Result<()> {
+        let mut events = self.events.lock().unwrap();
+
         // Block on the poller until at least one new event comes in.
-        self.poller.poll(events, timeout)?;
+        self.poller.poll(&mut events, timeout)?;
 
         // Lock the entire entry table while we're processing new events.
         let entries = self.entries.lock().unwrap();
@@ -177,7 +165,7 @@ impl<T: Evented> Watcher<T> {
     /// lifetime of the returned I/O handle.
     pub fn new(source: T) -> Watcher<T> {
         Watcher {
-            entry: SCHEDULER
+            entry: RUNTIME
                 .reactor()
                 .register(&source)
                 .expect("cannot register an I/O event source"),
@@ -262,7 +250,7 @@ impl<T: Evented> Watcher<T> {
     #[allow(dead_code)]
     pub fn into_inner(mut self) -> T {
         let source = self.source.take().unwrap();
-        SCHEDULER
+        RUNTIME
             .reactor()
             .deregister(&source, &self.entry)
             .expect("cannot deregister I/O event source");
@@ -273,7 +261,7 @@ impl<T: Evented> Watcher<T> {
 impl<T: Evented> Drop for Watcher<T> {
     fn drop(&mut self) {
         if let Some(ref source) = self.source {
-            SCHEDULER
+            RUNTIME
                 .reactor()
                 .deregister(source, &self.entry)
                 .expect("cannot deregister I/O event source");
