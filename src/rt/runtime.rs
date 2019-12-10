@@ -14,7 +14,10 @@ use crate::task::Runnable;
 use crate::utils::{abort_on_panic, random, Spinlock};
 
 thread_local! {
+    /// A reference to the current machine, if the current thread runs tasks.
     static MACHINE: OnceCell<Arc<Machine>> = OnceCell::new();
+
+    /// This flag is set to true whenever `task::yield_now()` is invoked.
     static YIELD_NOW: Cell<bool> = Cell::new(false);
 }
 
@@ -73,6 +76,7 @@ impl Runtime {
         &self.reactor
     }
 
+    /// Flushes the task slot so that tasks get run more fairly.
     pub fn yield_now(&self) {
         YIELD_NOW.with(|flag| flag.set(true));
     }
@@ -80,8 +84,8 @@ impl Runtime {
     /// Schedules a task.
     pub fn schedule(&self, task: Runnable) {
         MACHINE.with(|machine| {
-            // If the current thread is a worker thread, store it into its task slot or push it
-            // into its local task queue. Otherwise, push it into the global task queue.
+            // If the current thread is a worker thread, schedule it onto the current machine.
+            // Otherwise, push it into the global task queue.
             match machine.get() {
                 None => {
                     self.injector.push(task);
@@ -92,13 +96,14 @@ impl Runtime {
         });
     }
 
-    /// Drives the runtime on the current thread.
+    /// Runs the runtime on the current thread.
     pub fn run(&self) {
         scope(|s| {
             let mut idle = 0;
             let mut delay = 0;
 
             loop {
+                // Get a list of new machines to start, if any need to be started.
                 for m in self.make_machines() {
                     idle = 0;
 
@@ -113,6 +118,7 @@ impl Runtime {
                         .expect("cannot start a machine thread");
                 }
 
+                // Sleep for a bit longer if the scheduler state hasn't changed in a while.
                 if idle > 10 {
                     delay = (delay * 2).min(10_000);
                 } else {
@@ -126,12 +132,13 @@ impl Runtime {
         .unwrap();
     }
 
+    /// Returns a list of machines that need to be started.
     fn make_machines(&self) -> Vec<Arc<Machine>> {
         let mut sched = self.sched.lock().unwrap();
         let mut to_start = Vec::new();
 
-        // If there is a machine that is stuck on a task and not making any progress, steal
-        // its processor and start a new machine to take over.
+        // If there is a machine that is stuck on a task and not making any progress, steal its
+        // processor and set up a new machine to take over.
         for m in &mut sched.machines {
             if !m.progress.swap(false, Ordering::SeqCst) {
                 let opt_p = m.processor.try_lock().and_then(|mut p| p.take());
@@ -143,6 +150,8 @@ impl Runtime {
             }
         }
 
+        // If no machine has been polling the reactor in a while, that means the runtime is
+        // overloaded with work and we need to start another machine.
         if !sched.polling {
             if !sched.progress {
                 if let Some(p) = sched.processors.pop() {
@@ -158,12 +167,16 @@ impl Runtime {
         to_start
     }
 
-    /// Notifies the reactor.
+    /// Unparks a thread polling the reactor.
     fn notify(&self) {
         atomic::fence(Ordering::SeqCst);
         self.reactor.notify().unwrap();
     }
 
+    /// Attempts to poll the reactor without blocking on it.
+    ///
+    /// This function might not poll the reactor at all so do not rely on it doing anything. Only
+    /// use for optimization.
     fn quick_poll(&self) {
         if let Ok(sched) = self.sched.try_lock() {
             if !sched.polling {
@@ -173,12 +186,17 @@ impl Runtime {
     }
 }
 
+/// A thread running a processor.
 struct Machine {
+    /// Holds the processor until it gets stolen.
     processor: Spinlock<Option<Processor>>,
+
+    /// Gets set to `true` before running every task to indicate the machine is not stuck.
     progress: AtomicBool,
 }
 
 impl Machine {
+    /// Creates a new machine running a processor.
     fn new(p: Processor) -> Machine {
         Machine {
             processor: Spinlock::new(Some(p)),
@@ -186,6 +204,7 @@ impl Machine {
         }
     }
 
+    /// Schedules a task onto the machine.
     fn schedule(&self, rt: &Runtime, task: Runnable) {
         match self.processor.lock().as_mut() {
             None => {
@@ -198,14 +217,18 @@ impl Machine {
 
     /// Finds the next runnable task.
     fn find_task(&self, rt: &Runtime) -> Option<Runnable> {
+        // First try finding a task in the local queue or in the global queue.
         if let Some(p) = self.processor.lock().as_mut() {
             if let Some(task) = p.pop_task().or_else(|| p.steal_from_global(rt)) {
                 return Some(task);
             }
         }
 
+        // Try polling the reactor, but don't block on it.
         rt.quick_poll();
 
+        // Try finding a task in the local queue, which might hold tasks woken by the reactor. If
+        // the local queue is still empty, try stealing from other processors.
         if let Some(p) = self.processor.lock().as_mut() {
             if let Some(task) = p.pop_task().or_else(|| p.steal_from_others(rt)) {
                 return Some(task);
@@ -215,11 +238,14 @@ impl Machine {
         None
     }
 
+    /// Runs the machine on the current thread.
     fn run(&self, rt: &Runtime) {
         /// Number of yields when no runnable task is found.
         const YIELDS: u32 = 3;
         /// Number of short sleeps when no runnable task in found.
         const SLEEPS: u32 = 1;
+        /// Number of runs in a row before the global queue is inspected.
+        const RUNS: u32 = 64;
 
         // The number of times the thread found work in a row.
         let mut runs = 0;
@@ -227,8 +253,10 @@ impl Machine {
         let mut fails = 0;
 
         loop {
+            // let the scheduler know this machine is making progress.
             self.progress.store(true, Ordering::SeqCst);
 
+            // Check if `task::yield_now()` was invoked and flush the slot if so.
             YIELD_NOW.with(|flag| {
                 if flag.replace(false) {
                     if let Some(p) = self.processor.lock().as_mut() {
@@ -237,7 +265,9 @@ impl Machine {
                 }
             });
 
-            if runs >= 64 {
+            // After a number of runs in a row
+            if runs >= RUNS {
+                runs = 0;
                 rt.quick_poll();
 
                 if let Some(p) = self.processor.lock().as_mut() {
@@ -247,7 +277,6 @@ impl Machine {
 
                     p.flush_slot(rt);
                 }
-                runs = 0;
             }
 
             // Try to find a runnable task.
@@ -263,7 +292,6 @@ impl Machine {
                 break;
             }
 
-            runs = 0;
             fails += 1;
 
             // Yield the current thread a few times.
@@ -278,7 +306,6 @@ impl Machine {
                 continue;
             }
 
-            fails = 0;
             let mut sched = rt.sched.lock().unwrap();
 
             if let Some(task) = self.find_task(rt) {
@@ -308,6 +335,9 @@ impl Machine {
             sched.polling = false;
             sched.machines.push(m);
             sched.progress = true;
+
+            runs = 0;
+            fails = 0;
         }
 
         let opt_p = self.processor.lock().take();
