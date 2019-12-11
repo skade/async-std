@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches:
+      - master
       - staging
       - trying
 
@@ -62,7 +63,7 @@ jobs:
       uses: actions-rs/cargo@v1
       with:
         command: test
-        args: --all --features unstable
+        args: --all --features unstable attributes
 
   check_fmt_and_docs:
     name: Checking fmt and docs
