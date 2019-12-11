@@ -265,7 +265,7 @@ impl Machine {
                 }
             });
 
-            // After a number of runs in a row
+            // After a number of runs in a row, poll reactor, steal global tasks, and flush.
             if runs >= RUNS {
                 runs = 0;
                 rt.quick_poll();
