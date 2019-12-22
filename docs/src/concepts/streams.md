@@ -61,7 +61,7 @@ To sum it up: `Stream`s give us the ability to check if a new item in the sequen
 
 So far, so easy. But how do we _drive_ this process? We cannot `.await` streams, as we need a `Future` to use `.await`.
 
-For a detailled overview of the `Stream` API, see [`the Streams chapter in the documentation`](TODO: link).
+For a detailed overview of the `Stream` API, see [`the Streams chapter in the documentation`](TODO: link to futures documentation).
 
 ## The connection between `Stream` and `Future`
 
@@ -165,12 +165,13 @@ Sometimes you have a single stream that you want to convert into multiple
 streams. The way to do this in `std` is by using [`crossbeam_channel`] (because
 don't use std channels).
 
-Similarly in async Rust `channel` is the right abstraction. By creating multiple
+Similarly, async-std ships a [`channel`] constructor in its `sync` module. By creating multiple
 channels we can use it to split a single stream into multiple streams based on
 its output.
 
 [`crossbeam_channel`]: https://docs.rs/crossbeam-channel/0.3.9/crossbeam_channel/
 [`sync::channel`]: https://doc.rust-lang.org/std/sync/mpsc/fn.channel.html
+[`channel`]: https://docs.rs/async_std/latest/async_std/sync/fn.channel.html
 
 ```rust
 use async_std::stream;
@@ -188,11 +189,43 @@ while let Some(num) = s.next().await {
 }
 ```
 
-Channels are currently [still being
-built](https://github.com/async-rs/async-std/issues/212) for `async-std`, but
-we expect to have them available in the near future.
-
-
 ## Channels
 
+Channels are `async-std`s standard way of communication between tasks. `async-std` channels are MPMC (Multiple Producers, Multiple Consumers). This means they can be used in all situations, specifically also 
 
+```rust
+use async_std::sync::channel;
+use async_std::task;
+
+fn main() {
+    let (sender1, receiver1) = channel::<String>(10);
+    let (sender2, receiver2) = (sender1.clone(), receiver1.clone());
+
+    task::spawn(async move {
+        loop {
+            if let Some(msg) = receiver1.recv().await {
+                println!("Receiver 1 received: {}", msg);
+            }
+        }
+    });
+    task::spawn(async move {
+        loop {
+            if let Some(msg) = receiver2.recv().await {
+                println!("Receiver 2 received: {}", msg);
+            }
+        }
+    });
+    task::spawn(async move {
+        loop {
+            sender1.send("message from Sender 1".into()).await;
+        }
+    });
+    task::spawn(async move {
+        loop {
+            sender2.send("message from Sender 2".into()).await;
+        }
+    });
+
+    task::block_on(async { loop { } });
+}
+```
