@@ -6,6 +6,8 @@ use crate::io;
 use crate::rt::RUNTIME;
 use crate::task::{JoinHandle, Task};
 use crate::utils::abort_on_panic;
+#[cfg(feature = "unstable")]
+use crate::tracing as tracing;
 
 /// Task builder that configures the settings of a new task.
 #[derive(Debug, Default)]
@@ -42,6 +44,9 @@ impl Builder {
             parent_task_id: Task::get_current(|t| t.id().0).unwrap_or(0),
         });
 
+        #[cfg(feature = "unstable")]
+        tracing::task::spawn(task.id().0, Task::get_current(|t| t.id().0).unwrap_or(0), task.name());
+
         let future = async move {
             // Drop task-locals on exit.
             defer! {
@@ -53,6 +58,11 @@ impl Builder {
                 trace!("completed", {
                     task_id: Task::get_current(|t| t.id().0),
                 });
+                #[cfg(feature = "unstable")]
+                {
+                    let trace_data = Task::get_current(|t| t.id().0);
+                    tracing::task::completed(trace_data.unwrap());
+                }
             }
 
             future.await
@@ -66,7 +76,7 @@ impl Builder {
 }
 
 /// A runnable task.
-pub struct Runnable(async_task::Task<Task>);
+pub struct Runnable(pub(crate) async_task::Task<Task>);
 
 impl Runnable {
     /// Runs the task by polling its future once.

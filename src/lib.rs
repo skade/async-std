@@ -261,6 +261,7 @@ cfg_default! {
 cfg_unstable! {
     pub mod pin;
     pub mod process;
+    pub mod tracing;
 
     mod unit;
     mod vec;
