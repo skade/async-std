@@ -47,10 +47,11 @@ std = [
   "pin-utils",
   "slab",
 ]
+tracing = []
 
 [dependencies]
 async-attributes = { version = "1.1.1", optional = true }
-async-task = { version = "1.0.0", optional = true }
+async-task = { version = "*", path = "../async-task", optional = true, features = ["tracing"] }
 broadcaster = { version = "0.2.6", optional = true, default-features = false, features = ["default-channels"] }
 crossbeam-channel = { version = "0.4.0", optional = true }
 crossbeam-deque = { version = "0.7.2", optional = true }
@@ -83,3 +84,10 @@ required-features = ["unstable"]
 [[example]]
 name = "tcp-ipv4-and-6-echo"
 required-features = ["unstable"]
+
+[[example]]
+name = "channel-ring"
+required-features = ["unstable"]
+
+[profile.release]
+debug = true
