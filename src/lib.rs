@@ -248,6 +248,8 @@ cfg_std! {
     pub mod stream;
     pub mod sync;
     pub mod task;
+
+    pub(crate) mod rt;
 }
 
 cfg_default! {
