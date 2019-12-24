@@ -3,7 +3,7 @@
 #[cfg_attr(not(feature = "tracing"), inline(always))]
 #[export_name="async_std_machine_starting"]
 /// Called whenever a machine is started.
-pub fn machine_starting(machine: *const ()) {
+pub fn machine_starting(machine_addr: *const ()) {
 }
 
 #[no_mangle]
@@ -11,7 +11,7 @@ pub fn machine_starting(machine: *const ()) {
 #[cfg_attr(not(feature = "tracing"), inline(always))]
 #[export_name="async_std_machine_scheduled_task"]
 /// Called whenever a machine scheduled a task, locally or in the global runtime.
-pub fn machine_scheduled_task(machine: *const (), task_id: u64, local: bool) {
+pub fn machine_scheduled_task(machine_addr: *const (), task_id: u64, local: bool) {
 }
 
 
@@ -21,6 +21,6 @@ pub fn machine_scheduled_task(machine: *const (), task_id: u64, local: bool) {
 #[export_name="async_std_machine_blocked"]
 /// Called whenever a machine is blocked an its processor is being
 /// stolen.
-pub fn machine_blocked(machine: *const ()) {
+pub fn machine_blocked(machine_addr: *const ()) {
 }
 
