@@ -26,9 +26,15 @@ class Machine:
         self.tasks = []
 
     def blocked_at(self, time_nanos):
-        (blocking_task, _, _) = self.tasks[-1]
-        blocking_task.blocked_at(time_nanos)
-        self.blocked_by.append((blocking_task, time_nanos))
+        if len(self.tasks) > 0:
+            (blocking_task, _, _) = self.tasks[-1]
+            blocking_task.blocked_at(time_nanos)
+            self.blocked_by.append((blocking_task, time_nanos))
+        else:
+            blocking_task = Task("NA", "NA")
+            blocking_task.blocked_at(time_nanos)
+            ghost_tasks.append(blocking_task)
+            self.blocked_by.append((blocking_task, time_nanos))
 
     def task_scheduled(self, task, local, time_nanos):
         self.tasks.append((task, local, time_nanos))
@@ -47,17 +53,28 @@ class Machine:
         n_vals = 0
         time_sum = 0
         for task in self.tasks:
+            if not task[0].finished():
+                continue
+
             n_vals += 1
             runlength = task[0].runlength()
             time_sum += runlength
-        avg_val = math.ceil(avg(time_sum, n_vals))
-        return avg_val
+
+        if n_vals > 0:
+            avg_val = math.ceil(avg(time_sum, n_vals))
+            return avg_val
+        else:
+            return 0
+
+    def never_seen_running_a_task(self):
+        return len(self.tasks) == 0 
 
 class Task:
     def __init__(self, task_id, parent_id):
         self.task_id = task_id
         self.parent_id = parent_id
         self.blockades = []
+        self._completed_at = None
 
     def spawned_at(self, time_nanos):
         self.spawned_at = time_nanos
@@ -75,10 +92,19 @@ class Task:
         return self.number_of_blockades() != 0;
 
     def completed_at(self, time_nanos):
-        self.completed_at = time_nanos
+        self._completed_at = time_nanos
+
+    def finished(self):
+        return self._completed_at != None
 
     def runlength(self):
-        return self.completed_at - self.spawned_at
+        return self._completed_at - self.spawned_at
+
+    def runlength_nsec_std(self):
+        if self.finished():
+            return nsecs_str(self.runlength())[0]
+        else:
+            return "NF"
 
 class ParentTask:
     def __init__(self, task_id):
@@ -103,29 +129,31 @@ def trace_begin():
         global seen_machines
         global seen_tasks
         global seen_parent_tasks
+        global ghost_tasks
         seen_machines = {}
         seen_tasks = {}
         seen_parent_tasks = {}
+        ghost_tasks = []
 
 def trace_end():
         print("in trace_end")
         print("------ REPORT ------")
         print("------ MACHINES  ------")
-        print("Number | Machine addr     | Tasks handled | Blockades | Task IDs                       | Avg Completion Time (secs)")
+        print("Number | Machine addr     | Tasks handled | Blockades | Avg Completion Time (secs)")
 
         machine_number = 0
         for (machine_addr, machine) in seen_machines.items():
                 machine_number += 1
-                print("%-6d | %-16s | %-13d | %-9d | %-30s | %-20s" % \
+                print("%-6d | %-16s | %-13d | %-9d | %-20s" % \
                       (machine_number, machine_addr, machine.task_handled(), machine.number_of_blockades(),
-                       ','.join(machine.task_ids()), nsecs_str(machine.avg_completion_time())[0]))
+                       nsecs_str(machine.avg_completion_time())[0]))
 
         print("------ TASKS  ------")
 
         print("Task id    | Parent id |  | spawned_at           | runlength            | Blockades")
         for (task_id, task) in seen_tasks.items():
                 print("%-10s | %-10s | %-20s | %-20s | %-4d" % \
-                      (task_id, task.parent_id, nsecs_str(task.spawned_at)[0], nsecs_str(task.runlength())[0], task.number_of_blockades()))
+                      (task_id, task.parent_id, nsecs_str(task.spawned_at)[0], task.runlength_nsec_strr(), task.number_of_blockades()))
 
         print("------ PARENT TASKS  ------")
 
@@ -133,6 +161,15 @@ def trace_end():
         for (task_id, task) in seen_parent_tasks.items():
                 print("%-10s | %-21s | %-20s " % \
                       (task_id, task.number_of_child_tasks(), task.ratio_of_child_tasks_blocked()))
+
+        print("------ NUMBER OF MACHINES NEVER SEEN RUNNING A TASK ------")
+        count = 0
+        for (machine_addr, machine) in seen_machines.items():
+            if machine.never_seen_running_a_task():
+                 count += 1
+        print("%d" % count)
+        print("------ NUMBER OF GHOST TASKS ------")
+        print("%d" % len(ghost_tasks))
 
 
 def raw_syscalls__sys_enter(event_name, context, common_cpu,
@@ -149,14 +186,14 @@ def trace_unhandled(event_name, context, event_fields_dict):
         print(context)
         print(' '.join(['%s=%s'%(k,str(v))for k,v in sorted(event_fields_dict.items())]))
 
-def probe_task__async_std_task_completed(event_name, context, common_cpu,
+def async_std__task_completed(event_name, context, common_cpu,
         common_secs, common_nsecs, common_pid, common_comm, common_callchain,
         probe_ip, task_id):
 
         task = seen_tasks[task_id]
         task.completed_at(common_nsecs)
 
-def probe_task__async_std_machine_scheduled_task(event_name, context, common_cpu,
+def async_std__machine_scheduled_task(event_name, context, common_cpu,
         common_secs, common_nsecs, common_pid, common_comm, common_callchain,
         probe_ip, machine_addr, task_id, local):
         
@@ -172,25 +209,27 @@ def probe_task__async_std_machine_scheduled_task(event_name, context, common_cpu
         machine.task_scheduled(task, local, common_nsecs)
 
 
-def probe_task__async_std_machine_blocked(event_name, context, common_cpu,
+def async_std__machine_blocked(event_name, context, common_cpu,
         common_secs, common_nsecs, common_pid, common_comm, common_callchain,
-        probe_ip, machine):
+        probe_ip, machine_addr):
 
-        machine = seen_machines[machine]
-        machine.blocked_at(common_nsecs)
+        if machine_addr in seen_machines:
+            machine = seen_machines[machine_addr]
+            machine.blocked_at(common_nsecs)
+        else:
+            machine = Machine(machine_addr, common_nsecs)
+            seen_machines[machine_addr] = machine
+            machine.blocked_at(common_nsecs)
 
 
-def probe_task__async_std_task_spawn(event_name, context, common_cpu,
+def async_std__task_spawn(event_name, context, common_cpu,
         common_secs, common_nsecs, common_pid, common_comm, common_callchain,
         probe_ip, task_id, parent_id, name):
+
         task = Task(task_id, parent_id)
         add_child(task, parent_id)
         task.spawned_at(common_nsecs)
         seen_tasks[task_id] = task
-
-def print_header(event_name, cpu, secs, nsecs, pid, comm):
-        print("%-20s %5u %05u.%09u %8u %-20s " % \
-        (event_name, cpu, secs, nsecs, pid, comm),)
 
 def add_child(task, parent_id):
         if parent_id in seen_parent_tasks:

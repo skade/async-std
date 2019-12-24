@@ -12,7 +12,7 @@ use once_cell::unsync::OnceCell;
 use crate::rt::Reactor;
 use crate::task::Runnable;
 use crate::utils::{abort_on_panic, random, Spinlock};
-#[cfg(feature = "unstable")]
+#[cfg(feature = "tracing")]
 use crate::tracing;
 
 thread_local! {
@@ -108,6 +108,7 @@ impl Runtime {
                 // Get a list of new machines to start, if any need to be started.
                 for m in self.make_machines() {
                     idle = 0;
+                    #[cfg(feature = "tracing")]
                     tracing::rt::machine_starting(m.as_ref() as *const Machine as *const _);
 
                     s.builder()
@@ -144,6 +145,7 @@ impl Runtime {
         // processor and set up a new machine to take over.
         for m in &mut sched.machines {
             if !m.progress.swap(false, Ordering::SeqCst) {
+                #[cfg(feature = "tracing")]
                 tracing::rt::machine_blocked(m.as_ref() as *const Machine as *const _);
 
                 let opt_p = m.processor.try_lock().and_then(|mut p| p.take());
@@ -213,11 +215,13 @@ impl Machine {
     fn schedule(&self, rt: &Runtime, task: Runnable) {
         match self.processor.lock().as_mut() {
             None => {
+                #[cfg(feature = "tracing")]
                 tracing::rt::machine_scheduled_task(self as *const Machine as *const (), task.0.tag().id().0, false);
                 rt.injector.push(task);
                 rt.notify();
             },
             Some(p) => {
+                #[cfg(feature = "tracing")]
                 tracing::rt::machine_scheduled_task(self as *const Machine as *const (), task.0.tag().id().0, true);
                 p.schedule(rt, task)
             },
@@ -283,6 +287,7 @@ impl Machine {
 
                 if let Some(p) = self.processor.lock().as_mut() {
                     if let Some(task) = p.steal_from_global(rt) {
+                        #[cfg(feature = "tracing")]
                         tracing::rt::machine_scheduled_task(self as *const Machine as *const (), task.0.tag().id().0, true);
                         p.schedule(rt, task);
                     }
@@ -293,6 +298,7 @@ impl Machine {
 
             // Try to find a runnable task.
             if let Some(task) = self.find_task(rt) {
+                #[cfg(feature = "tracing")]
                 tracing::rt::machine_scheduled_task(self as *const Machine as *const (), task.0.tag().id().0, true);
                 task.run();
                 runs += 1;
@@ -323,6 +329,7 @@ impl Machine {
 
             // One final check for available tasks while the scheduler is locked.
             if let Some(task) = self.find_task(rt) {
+                #[cfg(feature = "tracing")]
                 tracing::rt::machine_scheduled_task(self as *const Machine as *const (), task.0.tag().id().0, true);
                 self.schedule(rt, task);
                 continue;
