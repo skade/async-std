@@ -63,7 +63,7 @@ sudo perf probe -d "async_std:*"
 To record a run, use:
 
 ```sh
-sudo perf record target/releae/my_app -e "async_std:*"
+sudo perf record target/release/my_app -e "async_std:*"
 ```
 
 See `man perf-record` for more options, such as attaching to a running process.
