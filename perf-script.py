@@ -9,12 +9,14 @@
 
 import os
 import sys
+import math
 
 sys.path.append(os.environ['PERF_EXEC_PATH'] + \
         '/scripts/python/Perf-Trace-Util/lib/Perf/Trace')
 
 from perf_trace_context import *
 from Core import *
+from Util import *
 
 class Machine:
     def __init__(self, machine_id, started_at_nanos):
@@ -37,6 +39,20 @@ class Machine:
     def number_of_blockades(self):
         return len(self.blocked_by)
 
+    def task_ids(self):
+        for task in self.tasks:
+            yield str(task[0].task_id)
+
+    def avg_completion_time(self):
+        n_vals = 0
+        time_sum = 0
+        for task in self.tasks:
+            n_vals += 1
+            runlength = task[0].runlength()
+            time_sum += runlength
+        avg_val = math.ceil(avg(time_sum, n_vals))
+        return avg_val
+
 class Task:
     def __init__(self, task_id, parent_id):
         self.task_id = task_id
@@ -52,8 +68,17 @@ class Task:
     def blocked_at(self, time_nanos):
         self.blockades.append(time_nanos)
 
+    def number_of_blockades(self):
+        return len(self.blockades)
+
+    def ever_blocked(self):
+        return self.number_of_blockades() != 0;
+
     def completed_at(self, time_nanos):
         self.completed_at = time_nanos
+
+    def runlength(self):
+        return self.completed_at - self.spawned_at
 
 class ParentTask:
     def __init__(self, task_id):
@@ -63,6 +88,15 @@ class ParentTask:
     def add_child_task(self, task):
         self.children.append(task)
 
+    def number_of_child_tasks(self):
+        return len(self.children)
+
+    def ratio_of_child_tasks_blocked(self):
+        num_blocked = 0;
+        for child in self.children:
+             if child.ever_blocked():
+                 num_blocked += 1
+        return num_blocked / self.number_of_child_tasks()
 
 def trace_begin():
         print("in trace_begin")
@@ -76,11 +110,29 @@ def trace_begin():
 def trace_end():
         print("in trace_end")
         print("------ REPORT ------")
-        print("Machine addr     | Tasks handled | Blockades | Task IDs")
+        print("------ MACHINES  ------")
+        print("Number | Machine addr     | Tasks handled | Blockades | Task IDs                       | Avg Completion Time (secs)")
 
+        machine_number = 0
         for (machine_addr, machine) in seen_machines.items():
-                print("%-16s | %-13d | %-10d " % \
-                      (machine_addr, machine.task_handled(), machine.number_of_blockades()))
+                machine_number += 1
+                print("%-6d | %-16s | %-13d | %-9d | %-30s | %-20s" % \
+                      (machine_number, machine_addr, machine.task_handled(), machine.number_of_blockades(),
+                       ','.join(machine.task_ids()), nsecs_str(machine.avg_completion_time())[0]))
+
+        print("------ TASKS  ------")
+
+        print("Task id    | Parent id |  | spawned_at           | runlength            | Blockades")
+        for (task_id, task) in seen_tasks.items():
+                print("%-10s | %-10s | %-20s | %-20s | %-4d" % \
+                      (task_id, task.parent_id, nsecs_str(task.spawned_at)[0], nsecs_str(task.runlength())[0], task.number_of_blockades()))
+
+        print("------ PARENT TASKS  ------")
+
+        print("Task id    | Number of child tasks | Ratio of child tasks blocked")
+        for (task_id, task) in seen_parent_tasks.items():
+                print("%-10s | %-21s | %-20s " % \
+                      (task_id, task.number_of_child_tasks(), task.ratio_of_child_tasks_blocked()))
 
 
 def raw_syscalls__sys_enter(event_name, context, common_cpu,
@@ -106,7 +158,7 @@ def probe_task__async_std_task_completed(event_name, context, common_cpu,
 
 def probe_task__async_std_machine_scheduled_task(event_name, context, common_cpu,
         common_secs, common_nsecs, common_pid, common_comm, common_callchain,
-        probe_ip, machine_addr, local, task_id):
+        probe_ip, machine_addr, task_id, local):
         
         machine = None
         if machine_addr in seen_machines:
@@ -116,6 +168,7 @@ def probe_task__async_std_machine_scheduled_task(event_name, context, common_cpu
                 seen_machines[machine_addr] = machine
 
         task = seen_tasks[task_id]
+
         machine.task_scheduled(task, local, common_nsecs)
 
 
@@ -130,7 +183,6 @@ def probe_task__async_std_machine_blocked(event_name, context, common_cpu,
 def probe_task__async_std_task_spawn(event_name, context, common_cpu,
         common_secs, common_nsecs, common_pid, common_comm, common_callchain,
         probe_ip, task_id, parent_id, name):
-
         task = Task(task_id, parent_id)
         add_child(task, parent_id)
         task.spawned_at(common_nsecs)
